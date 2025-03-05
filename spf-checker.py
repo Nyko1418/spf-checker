@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 
-# This line tells the system to use Python 3 to run the script. It’s like a signpost for the computer!
-
 import argparse  # Helps us handle command-line arguments like --detail or --ipv6
 import json  # For exporting results to JSON files
 import csv  # For exporting results to CSV files
@@ -13,16 +11,19 @@ import logging  # Lets us print debug messages to understand what’s happening
 from datetime import datetime  # Not used here, but included for potential future timestamping
 import re  # Regular expressions to check for patterns like "spf-12345678.pphosted.com"
 
+
 class SPFValidator:
     # This class does all the heavy lifting: fetching, validating, and counting IPs in SPF records
     def __init__(self, domain: str, include_ipv6: bool = False, debug: bool = False):
         # Constructor sets up our object with the domain we’re checking and some options
-        self.domain = domain.lower()  # Convert domain to lowercase (e.g., "GODIER.NET" -> "godier.net")
+        self.domain = domain.lower()  # Convert domain to lowercase
         self.include_ipv6 = include_ipv6  # Should we count IPv6 addresses? Default is no
         self.debug = debug  # Should we print extra info for debugging? Default is no
         self.ip_counts: Dict[str, Dict[str, int]] = {}  # Stores IP counts for each mechanism (e.g., "mx": {"ipv4": 4})
         self.includes_seen: List[str] = []  # Tracks domains we’ve seen in "include:" to avoid loops
         self.top_level_mechanisms: List[str] = []  # Keeps the main parts of the SPF record we’re checking
+        self.dmarc_policy: Optional[str] = None
+        self.dmarc_record: Optional[str] = None
         self.max_includes = 10  # RFC 7208 says no more than 10 includes to prevent abuse
         self.setup_logging()  # Set up our debug logging system
 
@@ -43,7 +44,7 @@ class SPFValidator:
                 if isinstance(rdata.strings, (list, tuple)):
                     txt = ''.join(
                         s.decode('utf-8') if isinstance(s, bytes) else s 
-                        for s in rdata.strings
+                        for s in rdata.strings 
                     )  # Combine all parts into one string
                 else:
                     txt = rdata.strings.decode('utf-8') if isinstance(rdata.strings, bytes) else rdata.strings
@@ -56,6 +57,26 @@ class SPFValidator:
             self.logger.error(f"DNS query failed: {e}")  # Something went wrong with DNS
             return None
 
+    def fetch_dmarc_record(self) -> Optional[str]:
+        # Looks up the DMARC record for the domain
+        try:
+            dmarc_domain = f"_dmarc.{self.domain}"
+            answers = dns.resolver.resolve(dmarc_domain, 'TXT')
+            for rdata in answers:
+                txt = ''.join(s.decode('utf-8') if isinstance(s, bytes) else s for s in rdata.strings)
+                if txt.startswith('v=DMARC1'):
+                    for tag in txt.split(';'):
+                        tag = tag.strip()
+                        if tag.startswith('p='):
+                            policy = tag.split('=')[1].lower()
+                            if policy in ('none', 'quarantine', 'reject'):
+                                self.dmarc_policy = policy
+                    self.logger.debug(f"Found DMARC record: {txt}")
+                    return txt
+            return None
+        except dns.exception.DNSException as e:
+            self.logger.debug(f"DMARC DNS query failed: {e}")
+            return None
     def count_ips(self, mechanism: str) -> Tuple[int, int]:
         # Counts how many IPv4 and IPv6 addresses a mechanism (like "ip4:1.2.3.4/24") covers
         try:
@@ -122,7 +143,7 @@ class SPFValidator:
         if len(self.includes_seen) >= self.max_includes:  # Too many includes?
             self.logger.error("Exceeded maximum include lookups (RFC 7208 limit)")
             raise ValueError("Too many includes")  # Stop to follow the rules
-        
+
         self.includes_seen.append(include_domain)  # Mark this domain as seen
         validator = SPFValidator(include_domain, self.include_ipv6, self.debug)  # New checker for this domain
         spf_record = validator.fetch_spf_record()
@@ -147,6 +168,7 @@ class SPFValidator:
         # Main function: validates the SPF record and counts all IPs
         spf_record = self.fetch_spf_record()
         if not spf_record:  # No record?
+            self.dmarc_record = self.fetch_dmarc_record()
             return {"valid": False, "error": "No SPF record found", "ip_counts": {}, "total_ipv4": 0, "total_ipv6": 0, "spf_record": None, "has_pphosted_include": False, "includes_used": 0, "includes_percentage": 0}
 
         parts = spf_record.split()  # Split into pieces like "v=spf1", "mx", etc.
@@ -156,6 +178,7 @@ class SPFValidator:
         # Check if there’s a special "pphosted" include like "spf-12345678.pphosted.com"
         pphosted_pattern = re.compile(r'include:spf-\d{8}\.pphosted\.com')  # Looks for 8 digits
         has_pphosted_include = bool(pphosted_pattern.search(spf_record))  # True if found
+        self.dmarc_record = self.fetch_dmarc_record()
 
         total_ipv4, total_ipv6 = 0, 0
         # Save the main parts we’re checking (not "all" stuff)
@@ -184,17 +207,34 @@ class SPFValidator:
             "includes_percentage": includes_percentage
         }
 
-def display_results(result: Dict, detail: bool):
+def display_results(result: Dict, detail: bool, validator: SPFValidator):
     # Shows the results in a nice, readable way with colors and tables
     GREEN = '\033[32m'  # Green text for good stuff
-    RED = '\033[31m'  # Red text for warnings or bad stuff
+    RED = '\033[31m'  # Red text for warnings or bad stuff    
     RESET = '\033[0m'  # Back to normal text
     
     # Show the SPF record first so users know what we’re working with
-    if result['spf_record']:
-        print(f"\nSPF Record: {result['spf_record']}\n")
+    print("\nSPF Record:")
+    if result['spf_record']:        
+        print(f"{result['spf_record']}\n")
+    else:        
+        print(f"Not found\n")
+    print("DMARC Record:")
+    if validator.dmarc_record:        
+        print(f"{validator.dmarc_record}\n")
+        if validator.dmarc_policy == 'reject':
+            dmarc_color = GREEN
+        elif validator.dmarc_policy == 'quarantine':
+            dmarc_color = '\033[33m'  # Yellow
+        else:
+            dmarc_color = RED
+        if validator.dmarc_policy:
+            print(f"DMARC Policy: {dmarc_color}{validator.dmarc_policy}{RESET}\n")
+        else:
+            print(f"DMARC Policy: {dmarc_color}none{RESET}\n")
     else:
-        print(f"\nSPF Record: Not found\n")
+        print(f"Not found\n")
+        print(f"DMARC Policy: {RED}no entry{RESET}\n")
 
     # Tell the user if there’s a pphosted include
     if result['has_pphosted_include']:
@@ -284,7 +324,7 @@ if __name__ == "__main__":
     validator = SPFValidator(args.domain, args.ipv6, args.debug)  # Create our checker
     result = validator.validate()  # Do the work
     
-    display_results(result, args.detail)  # Show the results
+    display_results(result, args.detail, validator)  # Show the results
     
     if args.export:  # Save to a file if they asked
         format = 'json' if args.export.endswith('.json') else 'csv'
