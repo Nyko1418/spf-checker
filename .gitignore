@@ -1,0 +1,26 @@
+### .gitignore
+
+```gitignore
+# Environnement virtuel
+venv/
+.venv/
+spf_checker_env/
+
+# Fichiers de cache Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Fichiers spécifiques à Conda
+.conda/
+*.conda
+envs/
+
+# Fichiers spécifiques à VS Code
+.vscode/
+
+# app related
+spf-checker.bak
+results.json
+```
+
