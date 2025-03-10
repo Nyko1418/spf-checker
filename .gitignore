@@ -22,5 +22,7 @@ envs/
 # app related
 spf-checker.bak
 results.json
+text.txt
+spf_results_*
 ```
 
