@@ -10,6 +10,7 @@ from tabulate import tabulate
 import logging
 from datetime import datetime
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class SPFValidator:
     def __init__(self, domain: str, include_ipv6: bool = False, debug: bool = False):
@@ -21,10 +22,11 @@ class SPFValidator:
         self.top_level_mechanisms: List[str] = []
         self.dmarc_policy: Optional[str] = None
         self.dmarc_record: Optional[str] = None
-        self.max_includes = 10
+        self.max_includes = 10  # RFC 7208 limit for include lookups
         self.setup_logging()
 
     def setup_logging(self):
+        """Configure logging based on debug flag."""
         logging.basicConfig(
             level=logging.DEBUG if self.debug else logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s'
@@ -32,13 +34,11 @@ class SPFValidator:
         self.logger = logging.getLogger(__name__)
 
     def fetch_spf_record(self) -> Optional[str]:
+        """Fetch the SPF record for the domain."""
         try:
             answers = dns.resolver.resolve(self.domain, 'TXT')
             for rdata in answers:
-                if isinstance(rdata.strings, (list, tuple)):
-                    txt = ''.join(s.decode('utf-8') if isinstance(s, bytes) else s for s in rdata.strings)
-                else:
-                    txt = rdata.strings.decode('utf-8') if isinstance(rdata.strings, bytes) else rdata.strings
+                txt = ''.join(s.decode('utf-8') if isinstance(s, bytes) else s for s in rdata.strings)
                 if txt.startswith('v=spf1'):
                     self.logger.debug(f"Found SPF record: {txt}")
                     return txt
@@ -49,6 +49,7 @@ class SPFValidator:
             return None
 
     def fetch_dmarc_record(self) -> Optional[str]:
+        """Fetch the DMARC record for the domain."""
         try:
             dmarc_domain = f"_dmarc.{self.domain}"
             answers = dns.resolver.resolve(dmarc_domain, 'TXT')
@@ -64,36 +65,27 @@ class SPFValidator:
                     self.logger.debug(f"Found DMARC record: {txt}")
                     return txt
             return None
-        except dns.exception.DNSException as e:
-            self.logger.debug(f"DMARC DNS query failed: {e}")
+        except dns.exception.DNSException:
+            self.logger.debug(f"DMARC DNS query failed")
             return None
 
     def count_ips(self, mechanism: str) -> Tuple[int, int]:
+        """Count IPv4 and IPv6 addresses for a given SPF mechanism."""
         try:
             if mechanism.startswith('ip4:'):
                 ip_part = mechanism[4:]
                 if '/' in ip_part:
                     ip, prefix = ip_part.split('/')
                     prefix = int(prefix)
-                    if 0 <= prefix <= 32:
-                        return 2 ** (32 - prefix), 0
-                    else:
-                        self.logger.error(f"Invalid IPv4 prefix: {prefix}")
-                        return 0, 0
-                else:
-                    return 1, 0
+                    return 2 ** (32 - prefix), 0
+                return 1, 0
             elif mechanism.startswith('ip6:') and self.include_ipv6:
                 ip_part = mechanism[4:]
                 if '/' in ip_part:
                     ip, prefix = ip_part.split('/')
                     prefix = int(prefix)
-                    if 0 <= prefix <= 128:
-                        return 0, 2 ** (128 - prefix)
-                    else:
-                        self.logger.error(f"Invalid IPv6 prefix: {prefix}")
-                        return 0, 0
-                else:
-                    return 0, 1
+                    return 0, 2 ** (128 - prefix)
+                return 0, 1
             elif mechanism.startswith('include:'):
                 domain = mechanism.split(':', 1)[1]
                 return self.process_include(domain)
@@ -104,6 +96,7 @@ class SPFValidator:
         return 0, 0
 
     def resolve_a_or_mx(self, mechanism: str) -> Tuple[int, int]:
+        """Resolve A or MX records and count IP addresses."""
         ipv4_count, ipv6_count = 0, 0
         try:
             if mechanism == 'a':
@@ -119,23 +112,24 @@ class SPFValidator:
                     ipv4_count += len(dns.resolver.resolve(hostname, 'A'))
                     if self.include_ipv6:
                         ipv6_count += len(dns.resolver.resolve(hostname, 'AAAA'))
-        except dns.exception.DNSException as e:
-            self.logger.debug(f"Resolution failed for {mechanism}: {e}")
+        except dns.exception.DNSException:
+            self.logger.debug(f"Resolution failed for {mechanism}")
         return ipv4_count, ipv6_count
 
     def process_include(self, include_domain: str) -> Tuple[int, int]:
+        """Process an SPF include directive recursively."""
         if include_domain in self.includes_seen:
             self.logger.debug(f"Skipping duplicate include: {include_domain}")
             return 0, 0
         if len(self.includes_seen) >= self.max_includes:
-            self.logger.error("Exceeded maximum include lookups (RFC 7208 limit)")
+            self.logger.error("Exceeded maximum include lookups")
             raise ValueError("Too many includes")
 
         self.includes_seen.append(include_domain)
         validator = SPFValidator(include_domain, self.include_ipv6, self.debug)
         spf_record = validator.fetch_spf_record()
         if not spf_record or not spf_record.startswith('v=spf1'):
-            self.logger.debug(f"No valid SPF record for {include_domain}")
+            self.logger.debug(f"No valid SPF for {include_domain}")
             return 0, 0
 
         total_ipv4, total_ipv6 = 0, 0
@@ -147,19 +141,39 @@ class SPFValidator:
             total_ipv6 += ipv6
             if part not in self.ip_counts:
                 self.ip_counts[part] = {"ipv4": ipv4, "ipv6": ipv6}
-        
         self.ip_counts[include_domain] = {"ipv4": total_ipv4, "ipv6": total_ipv6}
         return total_ipv4, total_ipv6
 
     def validate(self) -> Dict:
+        """Validate the SPF record and return results."""
         spf_record = self.fetch_spf_record()
         if not spf_record:
             self.dmarc_record = self.fetch_dmarc_record()
-            return {"valid": False, "error": "No SPF record found", "ip_counts": {}, "total_ipv4": 0, "total_ipv6": 0, "spf_record": None, "has_pphosted_include": False, "includes_used": 0, "includes_percentage": 0}
+            return {
+                "valid": False,
+                "error": "No SPF record found",
+                "ip_counts": {},
+                "total_ipv4": 0,
+                "total_ipv6": 0,
+                "spf_record": None,
+                "has_pphosted_include": False,
+                "includes_used": 0,
+                "includes_percentage": 0
+            }
 
         parts = spf_record.split()
         if parts[0] != "v=spf1":
-            return {"valid": False, "error": "Invalid SPF version", "ip_counts": {}, "total_ipv4": 0, "total_ipv6": 0, "spf_record": spf_record, "has_pphosted_include": False, "includes_used": 0, "includes_percentage": 0}
+            return {
+                "valid": False,
+                "error": "Invalid SPF version",
+                "ip_counts": {},
+                "total_ipv4": 0,
+                "total_ipv6": 0,
+                "spf_record": spf_record,
+                "has_pphosted_include": False,
+                "includes_used": 0,
+                "includes_percentage": 0
+            }
 
         pphosted_pattern = re.compile(r'include:spf-\d{8}\.pphosted\.com')
         has_pphosted_include = bool(pphosted_pattern.search(spf_record))
@@ -168,7 +182,7 @@ class SPFValidator:
         total_ipv4, total_ipv6 = 0, 0
         self.top_level_mechanisms = [part for part in parts[1:] if part not in ('all', '+all', '-all', '~all', '?all')]
         for part in self.top_level_mechanisms:
-            ipv4, ipv6 = self.count_ips(part)  # Fixed: changed 'countips' to 'count_ips'
+            ipv4, ipv6 = self.count_ips(part)
             total_ipv4 += ipv4
             total_ipv6 += ipv6
             if part not in self.ip_counts:
@@ -189,25 +203,39 @@ class SPFValidator:
             "includes_percentage": includes_percentage
         }
 
+def validate_domain(domain: str, include_ipv6: bool, debug: bool) -> Tuple[str, Dict, SPFValidator]:
+    """Validate a single domain and return results with the validator instance."""
+    validator = SPFValidator(domain, include_ipv6, debug)
+    result = validator.validate()
+    return domain, result, validator
+
 def read_domains_from_file(filepath: str) -> List[str]:
-    domains = []
-    domain_pattern = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9](?:\.[a-zA-Z]{2,})+$')
+    """Read and validate domains from a file."""
+    domains = set()
     try:
         with open(filepath, 'r') as f:
-            for i, line in enumerate(f, 1):
-                domain = line.strip()
-                if not domain:
-                    continue
-                if not domain_pattern.match(domain):
-                    raise ValueError(f"Invalid domain at line {i}: {domain}")
-                domains.append(domain.lower())
+            content = f.read()
+            content = re.sub(r'ESMTP:\[.*?\]', '', content)  # Remove ESMTP:[domain]
+            domain_pattern = re.compile(
+                r'\b[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z]{2,63}\b',
+                re.IGNORECASE
+            )
+            matches = domain_pattern.findall(content)
+            if not matches:
+                raise ValueError("No valid domains found in file")
+            
+            for domain in matches:
+                domain = domain.lower().rstrip('.')
+                if len(domain) <= 253:  # RFC 1035 max domain length
+                    domains.add(domain)
         if not domains:
-            raise ValueError("File is empty or contains no valid domains")
-        return domains
+            raise ValueError("No valid domains after validation")
+        return list(domains)
     except FileNotFoundError:
         raise FileNotFoundError(f"File not found: {filepath}")
 
 def display_results(result: Dict, detail: bool, validator: SPFValidator, args: argparse.Namespace):
+    """Display validation results with color coding."""
     GREEN = '\033[32m'
     RED = '\033[31m'
     RESET = '\033[0m'
@@ -246,17 +274,16 @@ def display_results(result: Dict, detail: bool, validator: SPFValidator, args: a
         table = []
         for mechanism in validator.top_level_mechanisms:
             counts = result['ip_counts'].get(mechanism, {"ipv4": 0, "ipv6": 0})
-            ipv4 = counts.get('ipv4', 0)
-            row = [mechanism, f"{ipv4:,}"]
+            row = [mechanism, f"{counts['ipv4']:,}"]
             if args.ipv6:
-                ipv6 = counts.get('ipv6', 0)
-                row.append(f"{ipv6:,}")
+                row.append(f"{counts['ipv6']:,}")
             table.append(row)
         headers = ['Mechanism', 'IPv4 Count'] + (['IPv6 Count'] if args.ipv6 else [])
         print("\nDetailed IP Counts:")
         print(tabulate(table, headers=headers, tablefmt='grid'))
 
 def export_results(result: Dict, filename: str, format: str, validator: SPFValidator, domain: str):
+    """Export results for a single domain."""
     data = {
         "domain": domain,
         "valid": result['valid'],
@@ -279,13 +306,13 @@ def export_results(result: Dict, filename: str, format: str, validator: SPFValid
             writer.writerow(headers)
             for mech in validator.top_level_mechanisms:
                 counts = result['ip_counts'].get(mech, {"ipv4": 0, "ipv6": 0})
-                ipv4 = counts.get('ipv4', 0)
-                row = [mech, ipv4]
+                row = [mech, counts['ipv4']]
                 if validator.include_ipv6:
-                    row.append(counts.get('ipv6', 0))
+                    row.append(counts['ipv6'])
                 writer.writerow(row)
 
 def export_batch_results(results: Dict[str, Dict], filename: str, format: str):
+    """Export results for multiple domains."""
     if format == 'json':
         with open(filename, 'w') as f:
             json.dump(results, f, indent=2)
@@ -311,7 +338,7 @@ if __name__ == "__main__":
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("domain", nargs="?", help="Domain to check SPF record for")
-    group.add_argument("--file", help="File containing one domain per line")
+    group.add_argument("--file", help="File containing domains in any format")
     parser.add_argument("--detail", action="store_true", help="Show detailed IP counts for top-level mechanisms")
     parser.add_argument("--ipv6", action="store_true", help="Include IPv6 address counts")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
@@ -320,21 +347,28 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.file:
+        # Batch mode with multithreading
         domains = read_domains_from_file(args.file)
+        print(f"Found {len(domains)} domains to process: {', '.join(domains)}")
         results = {}
-        
-        for i, domain in enumerate(domains, 1):
-            print(f"\nProcessing {domain} ({i}/{len(domains)})")
-            validator = SPFValidator(domain, args.ipv6, args.debug)
-            result = validator.validate()
-            results[domain] = result
-            display_results(result, args.detail, validator, args)
-        
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_domain = {
+                executor.submit(validate_domain, domain, args.ipv6, args.debug): domain
+                for domain in domains
+            }
+            for future in as_completed(future_to_domain):
+                domain, result, validator = future.result()
+                results[domain] = result
+                display_results(result, args.detail, validator, args)
+                print("\n" + "-"*50 + "\n")  # Separator between results
+
         export_file = args.export or f"spf_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         export_format = 'json' if export_file.endswith('.json') else 'csv'
         export_batch_results(results, export_file, export_format)
         print(f"\nResults exported to {export_file}")
     else:
+        # Single domain mode
         validator = SPFValidator(args.domain, args.ipv6, args.debug)
         result = validator.validate()
         display_results(result, args.detail, validator, args)
